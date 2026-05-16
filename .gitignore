@@ -1,0 +1,8 @@
+.env
+htmls/
+textos/
+allcsv/
+logs/
+data/api_cooldown.txt
+__pycache__/
+smallcsv/

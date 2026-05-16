@@ -1,0 +1,8 @@
+pandas
+requests
+python-dotenv
+beautifulsoup4
+lxml
+html5lib
+googlesearch-python
+win10toast
