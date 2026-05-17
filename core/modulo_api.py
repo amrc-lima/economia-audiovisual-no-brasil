@@ -2,113 +2,137 @@ import os
 import requests
 import re
 import logging
-from googlesearch import search
+from duckduckgo_search import DDGS
 from dotenv import load_dotenv
 
+# ==========================================
+# 0. CONFIGURAÇÕES E CHAVES
+# ==========================================
 load_dotenv(os.path.join(os.path.dirname(__file__), '..', '.env'))
-
 TMDB_READ_TOKEN = os.getenv('TMDB_READ_TOKEN')
 OMDB_API_KEY = os.getenv('OMDB_API_KEY')
 
 class LimiteDiarioExcedido(Exception):
     pass
 
-# Configuração do Logger local do módulo
 logger = logging.getLogger('API_Logger')
 
-def fazer_requisicao(url, headers=None):
-    logger.debug(f"Req: {url}")
+# ==========================================
+# 1. REQUISIÇÃO TRANSPARENTE E SEGURA
+# ==========================================
+def fazer_requisicao(url, headers=None, tag=""):
+    logger.debug(f"Req: {url} {tag}")
     resp = requests.get(url, headers=headers, timeout=10)
     
     if resp.status_code == 429:
-        logger.error("Rate Limit (429) atingido na API.")
+        logger.error(f"Rate Limit (429) atingido na API. {tag}")
         raise LimiteDiarioExcedido("Erro 429: Rate Limit")
         
-    # 💡 O NOVO DRIBLE: Se o OMDb der 401, a gente lê o erro antes de o Python surtar
     if resp.status_code == 401 and 'omdbapi' in url:
         try:
-            erro_json = resp.json()
-            if 'limit' in erro_json.get('Error', '').lower():
-                logger.error("Limite OMDb atingido detectado no Erro 401!")
-                raise LimiteDiarioExcedido("Limite de 1000 requisições do OMDb atingido!")
-        except LimiteDiarioExcedido as e:
-            raise e
-        except:
-            pass # Se for outro erro, deixa o raise_for_status pegar normalmente
+            if 'limit' in resp.json().get('Error', '').lower():
+                logger.error(f"Limite OMDb atingido detectado no Erro 401! {tag}")
+                raise LimiteDiarioExcedido("Limite OMDb atingido!")
+        except LimiteDiarioExcedido as e: raise e
+        except: pass 
 
-    resp.raise_for_status() # O Leão de chácara volta a atuar aqui
+    resp.raise_for_status()
     json_resp = resp.json()
-    logger.debug(f"Resp JSON: {str(json_resp)[:500]}...") 
+    logger.debug(f"Resp JSON: {str(json_resp)[:150]}... {tag}") 
     return json_resp
 
-def buscar_imdb_no_google(nome_sujo, ano):
-    logger.info(f"[Oráculo] Perguntando ao Google sobre: '{nome_sujo}' ({ano})")
-    query = f'site:imdb.com/title/ "{nome_sujo}" {ano} movie'
-    try:
-        for url in search(query, num_results=3):
-            match = re.search(r'(tt\d+)', url)
-            if match:
-                imdb_id = match.group(1)
-                logger.info(f"   ↳ [Oráculo] Achou o ID: {imdb_id}")
-                return imdb_id
-    except Exception as e:
-        logger.warning(f"   ↳ [Oráculo] Falhou: {e}")
+# ==========================================
+# 2. ENGENHARIA DE TEXTO (NLP BÁSICO)
+# ==========================================
+def normalizar_titulo(titulo):
+    """Resolve apenas problemas estruturais léxicos comuns."""
+    t = titulo.upper()
+    t = t.replace('&', 'AND')
+    t = t.replace("'", "")
+    t = re.sub(r'\bIII\b', '3', t)
+    t = re.sub(r'\bII\b', '2', t)
+    t = re.sub(r'\bIV\b', '4', t)
+    return t.strip()
+
+# ==========================================
+# 3. O AVALIADOR DE CANDIDATOS (O CÉREBRO)
+# ==========================================
+def avaliar_candidatos(resultados, ano_ancine, nome_pesquisa):
+    """Filtra o lixo e garante que o filme pertence ao ano certo."""
+    if not resultados: 
+        return None
+    
+    candidatos_ordenados = sorted(resultados, key=lambda x: x.get('vote_count', 0), reverse=True)
+    nome_pesquisa_limpo = re.sub(r'[^A-Z0-9]', '', nome_pesquisa.upper())
+    
+    for cand in candidatos_ordenados:
+        data_tmdb = cand.get('release_date', '')
+        ano_tmdb = int(data_tmdb[:4]) if data_tmdb else 0
+        votos = cand.get('vote_count', 0)
+        titulo_tmdb = re.sub(r'[^A-Z0-9]', '', cand.get('original_title', '').upper())
+        
+        # REGRA 1 (Relançamentos como Titanic/Avatar): 
+        # Só ignora o ano SE o título for EXATAMENTE IGUAL e tiver mais de 1000 votos (Mundialmente Famoso)
+        if titulo_tmdb == nome_pesquisa_limpo and votos > 1000:
+            return cand
+            
+        # REGRA 2 (A TOLERÂNCIA DE 1 ANO): 
+        # Pega a diferença do Fuso Horário de estreia (ex: Saiu nos EUA final de 2019 e no BR início de 2020)
+        if ano_tmdb and abs(ano_tmdb - ano_ancine) <= 1:
+            if votos >= 5 or titulo_tmdb == nome_pesquisa_limpo:
+                return cand
+                
     return None
 
+# ==========================================
+# 4. ORÁCULO DE BUSCA SEMÂNTICA (DUCKDUCKGO)
+# ==========================================
+def buscar_imdb_no_ddg(nome_sujo, ano, tag):
+    logger.info(f"[Oráculo DDG] Buscando Semântica de: '{nome_sujo}' ({ano}) {tag}")
+    query = f"site:imdb.com/title {nome_sujo} {ano} movie"
+    
+    try:
+        with DDGS() as ddgs:
+            resultados = list(ddgs.text(query, max_results=3))
+            for res in resultados:
+                url = res.get('href', '')
+                match = re.search(r'(tt\d+)', url)
+                if match:
+                    imdb_id = match.group(1)
+                    logger.info(f"   ↳ [Oráculo] Achou o ID: {imdb_id} {tag}")
+                    return imdb_id
+    except Exception as e:
+        logger.warning(f"   ↳ [Oráculo] Falhou: {e} {tag}")
+    return None
+
+# ==========================================
+# 5. MOTOR PRINCIPAL DE EXTRAÇÃO
+# ==========================================
 def extrair_todas_as_infos(nome_filme, ano):
     headers_tmdb = {"accept": "application/json", "Authorization": f"Bearer {TMDB_READ_TOKEN}"}
     dados_completos = {}
-    nome_pesquisa = nome_filme.strip()
+    
+    nome_pesquisa = normalizar_titulo(nome_filme)
+    tag = f"@@{nome_filme}@@" 
     
     try:
         filme_valido = None
         imdb_id_oraculo = None
         
-        # 🟢 CAMADA 1: Busca Exata
-        logger.info(f"[T1] Tentativa de busca exata no TMDB: {nome_pesquisa}")
-        url_t1 = f"https://api.themoviedb.org/3/search/movie?query={nome_pesquisa}&primary_release_year={ano}&language=pt-BR"
-        resp_t1 = fazer_requisicao(url_t1, headers=headers_tmdb)
+        # 🟢 CAMADA 1: Busca Única no TMDB (O Avaliador resolve a tolerância de 1 ano)
+        logger.info(f"[Busca TMDB] Procurando: {nome_pesquisa} {tag}")
+        url_busca = f"https://api.themoviedb.org/3/search/movie?query={nome_pesquisa}&language=pt-BR"
+        resp_busca = fazer_requisicao(url_busca, headers=headers_tmdb, tag=tag)
         
-        # Só aceita se o filme for 'famoso' (Mais de 50 votos) para evitar curtas-metragens obscuros com o mesmo nome
-        if resp_t1.get('results'):
-            for candidato in resp_t1['results']:
-                if candidato.get('vote_count', 0) > 50:
-                    filme_valido = candidato
-                    logger.info(f"[T1] Sucesso: {filme_valido.get('title')} (ID: {filme_valido['id']})")
-                    break
-            
-        # 🟡 CAMADA 2: Sem Ano
-        if not filme_valido:
-            logger.info(f"[T2] Tentativa sem ano: {nome_pesquisa}")
-            url_t2 = f"https://api.themoviedb.org/3/search/movie?query={nome_pesquisa}&language=pt-BR"
-            resp_t2 = fazer_requisicao(url_t2, headers=headers_tmdb)
-            if resp_t2.get('results'):
-                for candidato in resp_t2['results'][:5]:
-                    data_tmdb = candidato.get('release_date', '')
-                    if data_tmdb and abs(int(data_tmdb[:4]) - ano) <= 1 and candidato.get('vote_count', 0) > 50:
-                        filme_valido = candidato
-                        logger.info(f"[T2] Sucesso (Aprovado na janela de 1 ano): {filme_valido.get('title')}")
-                        break
+        filme_valido = avaliar_candidatos(resp_busca.get('results', []), ano, nome_pesquisa)
+        if filme_valido:
+            logger.info(f"[TMDB] Aprovado na Régua de 1 Ano: {filme_valido.get('title')} | Votos: {filme_valido.get('vote_count')} {tag}")
 
-        # 🟠 CAMADA 3: Machado (Franquia)
-        if not filme_valido and (":" in nome_pesquisa or "-" in nome_pesquisa):
-            nome_curto = nome_pesquisa.replace("-", ":").split(":")[0].strip()
-            logger.info(f"[T3] Tentativa cortando subtítulo: {nome_curto}")
-            url_t3 = f"https://api.themoviedb.org/3/search/movie?query={nome_curto}&language=pt-BR"
-            resp_t3 = fazer_requisicao(url_t3, headers=headers_tmdb)
-            if resp_t3.get('results'):
-                for candidato in resp_t3['results'][:10]:
-                    data_tmdb = candidato.get('release_date', '')
-                    if data_tmdb and abs(int(data_tmdb[:4]) - ano) <= 1 and candidato.get('vote_count', 0) > 50:
-                        filme_valido = candidato
-                        logger.info(f"[T3] Sucesso com nome curto: {filme_valido.get('title')}")
-                        break
-
-        # 🟣 CAMADA 4: Oráculo
+        # 🟣 CAMADA 2: Oráculo (DuckDuckGo)
         if not filme_valido:
-            imdb_id_oraculo = buscar_imdb_no_google(nome_pesquisa, ano)
+            imdb_id_oraculo = buscar_imdb_no_ddg(nome_pesquisa, ano, tag)
             if not imdb_id_oraculo:
-                logger.error(f"[FALHA] Nenhuma camada encontrou o filme {nome_pesquisa}.")
+                logger.error(f"[FALHA TOTAL] O filme não pôde ser encontrado. {tag}")
                 return {}
 
         # -----------------------------
@@ -119,7 +143,7 @@ def extrair_todas_as_infos(nome_filme, ano):
         if filme_valido:
             filme_id = filme_valido['id']
             url_detalhes = f"https://api.themoviedb.org/3/movie/{filme_id}?language=pt-BR"
-            detalhes = fazer_requisicao(url_detalhes, headers=headers_tmdb)
+            detalhes = fazer_requisicao(url_detalhes, headers=headers_tmdb, tag=tag)
             
             for chave, valor in detalhes.items():
                 if isinstance(valor, (dict, list)): valor = str(valor)
@@ -130,14 +154,11 @@ def extrair_todas_as_infos(nome_filme, ano):
         elif imdb_id_oraculo:
             imdb_id_final = imdb_id_oraculo
         
-        # BATE NO OMDB COM O ID DO IMDB ACHADO!
+        # BATE NO OMDB!
         if imdb_id_final:
-            logger.info(f"[OMDB] Buscando dados para IMDb ID: {imdb_id_final}")
+            logger.info(f"[OMDB] Buscando dados para IMDb ID: {imdb_id_final} {tag}")
             url_omdb = f"http://www.omdbapi.com/?i={imdb_id_final}&apikey={OMDB_API_KEY}"
-            resp_omdb = fazer_requisicao(url_omdb)
-            
-            if resp_omdb.get('Response') == 'False' and 'limit' in resp_omdb.get('Error', '').lower():
-                raise LimiteDiarioExcedido("Limite de 1000 requisições do OMDb atingido!")
+            resp_omdb = fazer_requisicao(url_omdb, tag=tag)
             
             if resp_omdb.get('Response') == 'True':
                 for chave, valor in resp_omdb.items():
@@ -150,8 +171,8 @@ def extrair_todas_as_infos(nome_filme, ano):
 
         return dados_completos
         
-    except LimiteDiarioExcedido as e:
+    except LimiteDiarioExcedido as e: 
         raise e
     except Exception as e:
-        logger.error(f"Erro Crítico ao processar '{nome_pesquisa}': {e}")
+        logger.error(f"Erro Crítico: {e} {tag}")
         return dados_completos
