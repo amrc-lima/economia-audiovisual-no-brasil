@@ -1,5 +1,4 @@
 pandas
 requests
 python-dotenv
-duckduckgo-search
-win10toast
+google-genai
