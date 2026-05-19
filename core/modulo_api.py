@@ -1,31 +1,37 @@
 import os
 import requests
 import re
+import time
 import logging
-from duckduckgo_search import DDGS
+from google import genai
 from dotenv import load_dotenv
 
 # ==========================================
 # 0. CONFIGURAÇÕES E CHAVES
 # ==========================================
 load_dotenv(os.path.join(os.path.dirname(__file__), '..', '.env'))
+
 TMDB_READ_TOKEN = os.getenv('TMDB_READ_TOKEN')
 OMDB_API_KEY = os.getenv('OMDB_API_KEY')
+GEMINI_API_KEY = os.getenv('GEMINI_API_KEY')
 
-class LimiteDiarioExcedido(Exception):
-    pass
-
+class LimiteDiarioExcedido(Exception): pass
 logger = logging.getLogger('API_Logger')
+
+if GEMINI_API_KEY:
+    gemini_client = genai.Client(api_key=GEMINI_API_KEY)
+else:
+    gemini_client = None
 
 # ==========================================
 # 1. REQUISIÇÃO TRANSPARENTE E SEGURA
 # ==========================================
 def fazer_requisicao(url, headers=None, tag=""):
-    logger.debug(f"Req: {url} {tag}")
-    resp = requests.get(url, headers=headers, timeout=10)
+    logger.debug(f"Req GET -> {url} {tag}")
+    resp = requests.get(url, headers=headers, timeout=60) # Paciência de Sênior
     
     if resp.status_code == 429:
-        logger.error(f"Rate Limit (429) atingido na API. {tag}")
+        logger.error(f"Rate Limit (429) atingido na API TMDB/OMDB. {tag}")
         raise LimiteDiarioExcedido("Erro 429: Rate Limit")
         
     if resp.status_code == 401 and 'omdbapi' in url:
@@ -42,25 +48,16 @@ def fazer_requisicao(url, headers=None, tag=""):
     return json_resp
 
 # ==========================================
-# 2. ENGENHARIA DE TEXTO (NLP BÁSICO)
+# 2. AVALIADOR DE CANDIDATOS E LIMPEZA
 # ==========================================
 def normalizar_titulo(titulo):
-    """Resolve apenas problemas estruturais léxicos comuns."""
+    """Limpeza leve apenas de formatação inútil"""
     t = titulo.upper()
-    t = t.replace('&', 'AND')
-    t = t.replace("'", "")
-    t = re.sub(r'\bIII\b', '3', t)
-    t = re.sub(r'\bII\b', '2', t)
-    t = re.sub(r'\bIV\b', '4', t)
     return t.strip()
 
-# ==========================================
-# 3. O AVALIADOR DE CANDIDATOS (O CÉREBRO)
-# ==========================================
 def avaliar_candidatos(resultados, ano_ancine, nome_pesquisa):
     """Filtra o lixo e garante que o filme pertence ao ano certo."""
-    if not resultados: 
-        return None
+    if not resultados: return None
     
     candidatos_ordenados = sorted(resultados, key=lambda x: x.get('vote_count', 0), reverse=True)
     nome_pesquisa_limpo = re.sub(r'[^A-Z0-9]', '', nome_pesquisa.upper())
@@ -71,42 +68,54 @@ def avaliar_candidatos(resultados, ano_ancine, nome_pesquisa):
         votos = cand.get('vote_count', 0)
         titulo_tmdb = re.sub(r'[^A-Z0-9]', '', cand.get('original_title', '').upper())
         
-        # REGRA 1 (Relançamentos como Titanic/Avatar): 
-        # Só ignora o ano SE o título for EXATAMENTE IGUAL e tiver mais de 1000 votos (Mundialmente Famoso)
+        # Relançamentos famosos ignoram o ano
         if titulo_tmdb == nome_pesquisa_limpo and votos > 1000:
             return cand
             
-        # REGRA 2 (A TOLERÂNCIA DE 1 ANO): 
-        # Pega a diferença do Fuso Horário de estreia (ex: Saiu nos EUA final de 2019 e no BR início de 2020)
-        if ano_tmdb and abs(ano_tmdb - ano_ancine) <= 1:
+        # Tolerância de 2 anos de fuso horário
+        if ano_tmdb and abs(ano_tmdb - ano_ancine) <= 2:
             if votos >= 5 or titulo_tmdb == nome_pesquisa_limpo:
                 return cand
-                
     return None
 
 # ==========================================
-# 4. ORÁCULO DE BUSCA SEMÂNTICA (DUCKDUCKGO)
+# 3. O ORÁCULO DE IA (GEMINI 3.0)
 # ==========================================
-def buscar_imdb_no_ddg(nome_sujo, ano, tag):
-    logger.info(f"[Oráculo DDG] Buscando Semântica de: '{nome_sujo}' ({ano}) {tag}")
-    query = f"site:imdb.com/title {nome_sujo} {ano} movie"
+def corrigir_titulo_via_gemini(nome_sujo, ano, tag):
+    if not gemini_client:
+        logger.warning(f"[Oráculo] Chave do Gemini não configurada. {tag}")
+        return None
+        
+    logger.info(f"[Oráculo Gemini] Analisando o typo do governo para: '{nome_sujo}' {tag}")
     
+    prompt = f"""
+    Aja como um banco de dados de cinema.
+    O governo brasileiro listou um filme como "{nome_sujo}" no ano {ano}.
+    Este título pode conter erros ortográficos, numerais errados ou formatação suja.
+    Sua tarefa:
+    1. Descubra o filme real.
+    2. Devolva APENAS o Título Original do filme, no idioma do país em que ele foi produzido.
+    3. REGRA CRÍTICA: Se for um filme brasileiro, mantenha o título em Português. NÃO TRADUZA PARA INGLÊS.
+    4. Responda apenas com o nome do filme, sem aspas, sem pontos e sem explicações.
+    """
     try:
-        with DDGS() as ddgs:
-            resultados = list(ddgs.text(query, max_results=3))
-            for res in resultados:
-                url = res.get('href', '')
-                match = re.search(r'(tt\d+)', url)
-                if match:
-                    imdb_id = match.group(1)
-                    logger.info(f"   ↳ [Oráculo] Achou o ID: {imdb_id} {tag}")
-                    return imdb_id
+        response = gemini_client.models.generate_content(
+            model='gemini-3.0-flash-preview',
+            contents=prompt,
+        )
+        titulo_limpo = response.text.strip()
+        logger.info(f"   ↳ [Oráculo] A IA limpou o título para: '{titulo_limpo}' {tag}")
+        
+        # Pausa obrigatória para o Google não banir o IP (Rate Limit de 15 RPM)
+        time.sleep(4) 
+        
+        return titulo_limpo
     except Exception as e:
-        logger.warning(f"   ↳ [Oráculo] Falhou: {e} {tag}")
-    return None
+        logger.warning(f"   ↳ [Oráculo Gemini] Erro ou Timeout na IA: {e} {tag}")
+        return None
 
 # ==========================================
-# 5. MOTOR PRINCIPAL DE EXTRAÇÃO
+# 4. MOTOR PRINCIPAL DE EXTRAÇÃO
 # ==========================================
 def extrair_todas_as_infos(nome_filme, ano):
     headers_tmdb = {"accept": "application/json", "Authorization": f"Bearer {TMDB_READ_TOKEN}"}
@@ -117,44 +126,46 @@ def extrair_todas_as_infos(nome_filme, ano):
     
     try:
         filme_valido = None
-        imdb_id_oraculo = None
         
-        # 🟢 CAMADA 1: Busca Única no TMDB (O Avaliador resolve a tolerância de 1 ano)
-        logger.info(f"[Busca TMDB] Procurando: {nome_pesquisa} {tag}")
+        # 🟢 CAMADA 1: Busca TMDB Direta
+        logger.info(f"[Busca TMDB] Procurando original: {nome_pesquisa} {tag}")
         url_busca = f"https://api.themoviedb.org/3/search/movie?query={nome_pesquisa}&language=pt-BR"
         resp_busca = fazer_requisicao(url_busca, headers=headers_tmdb, tag=tag)
         
         filme_valido = avaliar_candidatos(resp_busca.get('results', []), ano, nome_pesquisa)
         if filme_valido:
-            logger.info(f"[TMDB] Aprovado na Régua de 1 Ano: {filme_valido.get('title')} | Votos: {filme_valido.get('vote_count')} {tag}")
-
-        # 🟣 CAMADA 2: Oráculo (DuckDuckGo)
+            logger.info(f"[TMDB] Aprovado na Camada 1: {filme_valido.get('title')} {tag}")
+            
+        # 🟣 CAMADA 2: Oráculo (LLM Assisted ETL)
         if not filme_valido:
-            imdb_id_oraculo = buscar_imdb_no_ddg(nome_pesquisa, ano, tag)
-            if not imdb_id_oraculo:
-                logger.error(f"[FALHA TOTAL] O filme não pôde ser encontrado. {tag}")
-                return {}
+            titulo_ia = corrigir_titulo_via_gemini(nome_pesquisa, ano, tag)
+            
+            if titulo_ia and titulo_ia.upper() != nome_pesquisa.upper():
+                logger.info(f"[Busca TMDB] Retentando com Título Limpo pela IA: {titulo_ia} {tag}")
+                url_busca_ia = f"https://api.themoviedb.org/3/search/movie?query={titulo_ia}&language=pt-BR"
+                resp_busca_ia = fazer_requisicao(url_busca_ia, headers=headers_tmdb, tag=tag)
+                
+                filme_valido = avaliar_candidatos(resp_busca_ia.get('results', []), ano, titulo_ia)
+                if filme_valido:
+                    logger.info(f"[TMDB] Aprovado após Correção IA: {filme_valido.get('title')} {tag}")
+
+        if not filme_valido:
+            logger.error(f"[FALHA TOTAL] Nenhuma camada encontrou o filme. {tag}")
+            return {}
 
         # -----------------------------
-        # CAPTURA DE DETALHES GERAIS
+        # CAPTURA DE DETALHES GERAIS (TMDB + OMDb)
         # -----------------------------
-        imdb_id_final = None
+        filme_id = filme_valido['id']
+        url_detalhes = f"https://api.themoviedb.org/3/movie/{filme_id}?language=pt-BR"
+        detalhes = fazer_requisicao(url_detalhes, headers=headers_tmdb, tag=tag)
         
-        if filme_valido:
-            filme_id = filme_valido['id']
-            url_detalhes = f"https://api.themoviedb.org/3/movie/{filme_id}?language=pt-BR"
-            detalhes = fazer_requisicao(url_detalhes, headers=headers_tmdb, tag=tag)
+        for chave, valor in detalhes.items():
+            if isinstance(valor, (dict, list)): valor = str(valor)
+            dados_completos[f"TMDB_{chave}"] = valor
             
-            for chave, valor in detalhes.items():
-                if isinstance(valor, (dict, list)): valor = str(valor)
-                dados_completos[f"TMDB_{chave}"] = valor
-                
-            imdb_id_final = detalhes.get('imdb_id')
-            
-        elif imdb_id_oraculo:
-            imdb_id_final = imdb_id_oraculo
+        imdb_id_final = detalhes.get('imdb_id')
         
-        # BATE NO OMDB!
         if imdb_id_final:
             logger.info(f"[OMDB] Buscando dados para IMDb ID: {imdb_id_final} {tag}")
             url_omdb = f"http://www.omdbapi.com/?i={imdb_id_final}&apikey={OMDB_API_KEY}"
@@ -174,5 +185,5 @@ def extrair_todas_as_infos(nome_filme, ano):
     except LimiteDiarioExcedido as e: 
         raise e
     except Exception as e:
-        logger.error(f"Erro Crítico: {e} {tag}")
+        logger.error(f"Erro Crítico Geral: {e} {tag}")
         return dados_completos
