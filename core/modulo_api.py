@@ -51,35 +51,54 @@ def fazer_requisicao(url, headers=None, tag=""):
 # 2. AVALIADOR DE CANDIDATOS E LIMPEZA
 # ==========================================
 def normalizar_titulo(titulo):
-    """Limpeza leve apenas de formatação inútil"""
+    """
+    Normaliza a estrutura léxica do título original.
+    Remove inconsistências de formatação para otimizar o pareamento na API.
+    """
     t = titulo.upper()
+    
+    # Substituições essenciais
+    t = t.replace('&', 'AND')
+    t = t.replace("'", "")
+    t = t.replace("#", "") # Remove hashtags que quebram as URLs (Fragment HTTP)
+    
+    # Tratamento de algarismos romanos de sequências
+    t = re.sub(r'\bIII\b', '3', t)
+    t = re.sub(r'\bII\b', '2', t)
+    t = re.sub(r'\bIV\b', '4', t)
+    
     return t.strip()
 
 def avaliar_candidatos(resultados, ano_ancine, nome_pesquisa):
-    """Filtra o lixo e garante que o filme pertence ao ano certo."""
+    """Filtra o lixo priorizando o ano correto (confiando no motor do TMDB) e entende relançamentos."""
     if not resultados: return None
     
+    # O Pulo do Gato: O filme certo quase sempre é o mais votado da lista de resultados.
     candidatos_ordenados = sorted(resultados, key=lambda x: x.get('vote_count', 0), reverse=True)
     nome_pesquisa_limpo = re.sub(r'[^A-Z0-9]', '', nome_pesquisa.upper())
     
+    # 🥇 PRIORIDADE 1: Janela de Lançamento (Abolimos o limite de votos e checagem de string!)
     for cand in candidatos_ordenados:
         data_tmdb = cand.get('release_date', '')
         ano_tmdb = int(data_tmdb[:4]) if data_tmdb else 0
+        
+        # Se a data bate com a tolerância de 2 anos, aceita na hora.
+        if ano_tmdb and abs(ano_tmdb - ano_ancine) <= 2:
+            return cand
+
+    # 🥈 PRIORIDADE 2: Relançamentos e Clássicos Absolutos (Titanic, Avatar)
+    # Aqui mantemos a checagem de string/votos porque a data já falhou na prioridade 1.
+    for cand in candidatos_ordenados:
         votos = cand.get('vote_count', 0)
         titulo_tmdb = re.sub(r'[^A-Z0-9]', '', cand.get('original_title', '').upper())
         
-        # Relançamentos famosos ignoram o ano
         if titulo_tmdb == nome_pesquisa_limpo and votos > 1000:
             return cand
             
-        # Tolerância de 2 anos de fuso horário
-        if ano_tmdb and abs(ano_tmdb - ano_ancine) <= 2:
-            if votos >= 5 or titulo_tmdb == nome_pesquisa_limpo:
-                return cand
     return None
 
 # ==========================================
-# 3. O ORÁCULO DE IA (GEMINI 3.0)
+# 3. O ORÁCULO DE IA (GEMINI 3.1 FLASH LITE - 500 RPD)
 # ==========================================
 def corrigir_titulo_via_gemini(nome_sujo, ano, tag):
     if not gemini_client:
@@ -98,22 +117,43 @@ def corrigir_titulo_via_gemini(nome_sujo, ano, tag):
     3. REGRA CRÍTICA: Se for um filme brasileiro, mantenha o título em Português. NÃO TRADUZA PARA INGLÊS.
     4. Responda apenas com o nome do filme, sem aspas, sem pontos e sem explicações.
     """
-    try:
-        response = gemini_client.models.generate_content(
-            model='gemini-3.0-flash-preview',
-            contents=prompt,
-        )
-        titulo_limpo = response.text.strip()
-        logger.info(f"   ↳ [Oráculo] A IA limpou o título para: '{titulo_limpo}' {tag}")
-        
-        # Pausa obrigatória para o Google não banir o IP (Rate Limit de 15 RPM)
-        time.sleep(4) 
-        
-        return titulo_limpo
-    except Exception as e:
-        logger.warning(f"   ↳ [Oráculo Gemini] Erro ou Timeout na IA: {e} {tag}")
-        return None
+    
+    # 💡 Usando o ÚNICO modelo com 500 de cota diária (provado pelo painel)
+    modelo_oficial = 'gemini-3.1-flash-lite'
+    
+    tentativas = 0
+    
+    while tentativas < 3:
+        try:
+            response = gemini_client.models.generate_content(
+                model=modelo_oficial,
+                contents=prompt,
+            )
+            titulo_limpo = response.text.strip()
+            logger.info(f"   ↳ [Oráculo - {modelo_oficial}] A IA limpou o título para: '{titulo_limpo}' {tag}")
+            
+            # Pausa obrigatória de 4 segundos (Garante que nunca passa de 15 RPM)
+            time.sleep(4) 
+            return titulo_limpo
 
+        except Exception as erro_ia:
+            erro_str = str(erro_ia)
+            
+            if "429" in erro_str or "Quota" in erro_str or "RESOURCE_EXHAUSTED" in erro_str:
+                if "PerDay" in erro_str or "GenerateRequestsPerDay" in erro_str:
+                    logger.error(f"   [Oráculo] Limite DIÁRIO (500) do {modelo_oficial} esgotado! {tag}")
+                    return None # Abandona a IA e deixa o Main.py entrar em Cooldown
+                        
+                else:
+                    # Se estourar a velocidade (RPM), pausa 60s
+                    logger.warning(f"   [Oráculo] Limite por MINUTO (RPM) atingido. Esfriando por 60s... {tag}")
+                    time.sleep(60)
+                    tentativas += 1
+            else:
+                logger.warning(f"   ↳ [Oráculo Gemini] Erro interno inesperado: {erro_ia} {tag}")
+                return None
+                
+    return None
 # ==========================================
 # 4. MOTOR PRINCIPAL DE EXTRAÇÃO
 # ==========================================
@@ -138,16 +178,20 @@ def extrair_todas_as_infos(nome_filme, ano):
             
         # 🟣 CAMADA 2: Oráculo (LLM Assisted ETL)
         if not filme_valido:
-            titulo_ia = corrigir_titulo_via_gemini(nome_pesquisa, ano, tag)
+            titulo_ia_bruto = corrigir_titulo_via_gemini(nome_pesquisa, ano, tag)
             
-            if titulo_ia and titulo_ia.upper() != nome_pesquisa.upper():
-                logger.info(f"[Busca TMDB] Retentando com Título Limpo pela IA: {titulo_ia} {tag}")
-                url_busca_ia = f"https://api.themoviedb.org/3/search/movie?query={titulo_ia}&language=pt-BR"
-                resp_busca_ia = fazer_requisicao(url_busca_ia, headers=headers_tmdb, tag=tag)
+            if titulo_ia_bruto:
+                # 💡 A SUA SACADA: Sanitiza também o que a IA respondeu!
+                titulo_ia = normalizar_titulo(titulo_ia_bruto)
                 
-                filme_valido = avaliar_candidatos(resp_busca_ia.get('results', []), ano, titulo_ia)
-                if filme_valido:
-                    logger.info(f"[TMDB] Aprovado após Correção IA: {filme_valido.get('title')} {tag}")
+                if titulo_ia != nome_pesquisa:
+                    logger.info(f"[Busca TMDB] Retentando com Título Limpo pela IA: {titulo_ia} {tag}")
+                    url_busca_ia = f"https://api.themoviedb.org/3/search/movie?query={titulo_ia}&language=pt-BR"
+                    resp_busca_ia = fazer_requisicao(url_busca_ia, headers=headers_tmdb, tag=tag)
+                    
+                    filme_valido = avaliar_candidatos(resp_busca_ia.get('results', []), ano, titulo_ia)
+                    if filme_valido:
+                        logger.info(f"[TMDB] Aprovado após Correção IA: {filme_valido.get('title')} {tag}")
 
         if not filme_valido:
             logger.error(f"[FALHA TOTAL] Nenhuma camada encontrou o filme. {tag}")
@@ -161,7 +205,6 @@ def extrair_todas_as_infos(nome_filme, ano):
         detalhes = fazer_requisicao(url_detalhes, headers=headers_tmdb, tag=tag)
         
         for chave, valor in detalhes.items():
-            if isinstance(valor, (dict, list)): valor = str(valor)
             dados_completos[f"TMDB_{chave}"] = valor
             
         imdb_id_final = detalhes.get('imdb_id')
@@ -177,7 +220,6 @@ def extrair_todas_as_infos(nome_filme, ano):
                         for avaliacao in valor:
                             if avaliacao.get('Source') == 'Rotten Tomatoes':
                                 dados_completos["OMDB_RottenTomatoes"] = avaliacao.get('Value', '').replace('%', '')
-                    if isinstance(valor, (dict, list)): valor = str(valor)
                     dados_completos[f"OMDB_{chave}"] = valor
 
         return dados_completos
