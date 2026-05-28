@@ -22,20 +22,29 @@ Para garantir o rigor estatístico desta análise e evitar o viés de confirmaç
 
 O objetivo é auditar a qualidade da **média** do cinema nacional em comparação à **média** dos blockbusters enlatados (ex: *Marvel, Transformers, Pânico, Velozes e Furiosos*). Para chancelar a qualidade de forma imparcial, o projeto consome APIs de avaliação internacional (**Rotten Tomatoes e Metacritic** via OMDb API), comprovando que a crítica especializada estrangeira avalia o cinema brasileiro independente com notas substancialmente superiores às dos produtos hegemônicos estrangeiros.
 
-## 🗄️ 4. Arquitetura do Data Lake (Single Source of Truth)
-O projeto adota uma esteira de **Raw Ingestion (Ingestão Bruta Constante)**, extraindo mais de 70 colunas de metadados de APIs globais para compor um *Data Warehouse* local, garantindo análises multidimensionais sem necessidade de reprocessamento. A arquitetura de pastas segue rigorosos padrões de governança e isolamento de ambiente:
+## 🛠️ 4. Arquitetura do Data Lakehouse (Apache Parquet)
+O projeto adota uma esteira de **Raw Ingestion (Ingestão Bruta Constante)**, extraindo mais de 70 colunas de metadados de APIs globais. Para garantir performance analítica e suporte a estruturas complexas, a base matriz utiliza o formato colunar **Apache Parquet**, permitindo:
 
-*   📁 `data/` **(Hot Data):** Ambiente de produção. Contém o `master_filmes_db.csv` (Base unificada com schema dinâmico, mesclando a arrecadação oficial governamental com metadados globais) e a área de Quarentena de Dados (`issues.csv`).
-*   📁 `core/` **(The Engine):** Módulos Python isolados (`main.py`, `modulo_ancine.py`, `modulo_api.py`, `issues.py`) orquestrando o pipeline de forma escalável e tolerante a falhas.
-*   📁 `logs/` **(Observability):** Histórico de execução diária (Dual Logging), isolando ruídos internos das bibliotecas de rede e garantindo rastreabilidade absoluta via Tagging individual (`@@`) por requisição.
+*   **Tipagem Nativa Avançada:** Diferente do CSV, o projeto preserva a inteligência dos dados, armazenando gêneros, elenco e países como **Arrays e Structs** nativos, otimizando filtros e cruzamentos no Power BI.
+*   📁 `data/` **(Hot Data):** Ambiente de produção. Contém o `master_filmes_db.parquet` (Base unificada de alta compressão) e a área de Quarentena de Dados (`issues.csv`).
+*   📁 `core/` **(The Engine):** Módulos Python isolados orquestrando o pipeline de forma escalável e tolerante a falhas.
+*   📁 `logs/` **(Observability):** Histórico de execução diária (Dual Logging) com rastreabilidade absoluta via Tagging individual (`@@`) por requisição.
 
 ## 🧠 5. Engenharia de Dados e Resiliência (The Engine)
-Bases governamentais frequentemente contêm erros crônicos de digitação (typos), traduções forçadas e datas de lançamento divergentes (fuso entre o lançamento internacional vs. brasileiro). Para garantir 100% de precisão no pareamento de dados, o motor opera com **Inteligência Sistêmica e Auto-Cura**:
+Bases governamentais frequentemente contêm erros crônicos de digitação. Para garantir precisão, o motor opera com **Inteligência Sistêmica e Auto-Cura**:
 
-1.  **Avaliador Semântico (Gatekeeper):** Para evitar falsos positivos de curtas-metragens homônimos, o cérebro do pipeline cruza *Título* + *Window de Tolerância* temporal (±2 anos) + *Volume de Votos Mínimo* do TMDB. Relançamentos mundiais possuem regra de exceção preditiva.
-2.  **Oráculo de IA (LLM-Assisted ETL):** Em caso de falha nas APIs devido a erros severos do governo, o script aciona a API do **Google Gemini (3.0 Flash)**. O Modelo de Linguagem atua como corretor ortográfico e tradutor reverso, devolvendo o título original correto para reintrodução na esteira, evitando falsos negativos.
-3.  **Auto-cura e Quarentena (Data Quality):** O módulo auditor (`issues.py`) varre o banco mestre em busca de *Bad Data* (Ex: filmes não encontrados), extrai as anomalias para uma quarentena, filtra os *Trace Logs* daquelas operações via Regex e higieniza a base oficial de forma autônoma para permitir retentativas.
-4.  **Checkpointing Atômico e Cooldown Intelligence:** O motor persiste o estado diretamente no disco a cada iteração de sucesso. Ao esbarrar no *Rate Limit* de 1.000 requisições diárias de APIs terceiras (OMDb), o algoritmo registra o *timestamp* da falha, envia Notificações (Toasts) nativas no Windows, entra em Suspensão Profunda e **desperta automaticamente no milissegundo exato após 24 horas**, retomando a extração. Em caso de execução invisível em background, invoca um Popup interativo via Win32 API.
+1.  **Heurística Léxica e Lab de Testes:** Normalização estrutural via *Regex* (tratamento de algarismos romanos e caracteres especiais).
+2.  **Avaliador Semântico:** Cruzamento dinâmico de *Título* + *Window de Tolerância* (±2 anos) + *Volume de Votos*.
+3.  **Oráculo de IA (LLM-Assisted ETL):** Em caso de falha nas APIs, o script aciona o **Google Gemini (3.1 Flash Lite)** para correção ortográfica e tradução reversa em alta velocidade.
+4.  **Auditoria Forense e Quarentena:** O módulo `issues.py` realiza uma **Auditoria Reversa** nos logs, identificando "filmes fantasmas" (erros que impediram a entrada no banco) e higienizando a base via *Atomic Write*.
+5.  **Checkpointing Atômico e Cooldown:** Persistência de estado e gestão inteligente de *Rate Limits*, com notificações nativas e retentativa automática.
+
+## 🛠️ Tech Stack e Ferramentas
+![Python](https://img.shields.io/badge/python-3670A0?style=for-the-badge&logo=python&logoColor=ffdd54)
+![Pandas](https://img.shields.io/badge/pandas-%23150458.svg?style=for-the-badge&logo=pandas&logoColor=white)
+![Apache Parquet](https://img.shields.io/badge/Apache_Parquet-63B0FB?style=for-the-badge&logo=apache&logoColor=white)
+![Google Gemini](https://img.shields.io/badge/Google_Gemini-8E75B2?style=for-the-badge&logo=googlegemini&logoColor=white)
+![Power Bi](https://img.shields.io/badge/power_bi-F2C811?style=for-the-badge&logo=microsoftpowerbi&logoColor=black)
 
 ## 📊 6. Escopo do Dashboard e KPIs Definidos
 O *Master Database* gerado alimenta um painel executivo (Power BI) estruturado via *Star Schema*, focado em Inteligência de Mercado e Economia Política:

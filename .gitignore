@@ -2,7 +2,10 @@
 htmls/
 textos/
 allcsv/
+*.log
 logs/
 data/api_cooldown.txt
 __pycache__/
 smallcsv/
+diff.txt
+tree.txt
