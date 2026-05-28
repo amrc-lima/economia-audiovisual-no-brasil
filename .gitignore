@@ -7,5 +7,9 @@ logs/
 data/api_cooldown.txt
 __pycache__/
 smallcsv/
+# Auditoria e Logs de Erro
+*issues*
+!**/issues.py
+
 diff.txt
 tree.txt
